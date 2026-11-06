@@ -1,0 +1,68 @@
+GOME-LSIF v1.0 User Guide
+
+1. Dataset overview
+-------------------
+GOME-LSIF provides orbit-level solar-induced chlorophyll fluorescence (SIF)
+at 740 nm from ERS-2 GOME observations for 1 July 1995 to 30 June 2011.
+The data include radiometric degradation and zero-offset corrections.
+They represent individual satellite observations, not gridded or daily-mean SIF.
+Retrieval and validation methods are described in the accompanying paper.
+
+2. File organization
+--------------------
+Files are provided in NetCDF format, organized as:
+  YYYY/YYYYMMDD/original_GOME_L1b_filename_SIF.nc
+
+Each file corresponds to one GOME orbit and contains retained observations
+along the record dimension. Record counts vary between files; a file with
+zero records contains no retained observations. The filename includes the
+original orbit start and end times. Per-observation times are not included.
+
+3. Main variables
+-----------------
+The recommended variable for scientific use is sif_740_zero_offset_corrected.
+
+Variable                         Description
+sif_740_zero_offset_corrected    SIF after both corrections
+sif_740                          SIF before zero-offset correction
+sif_bias                         Estimated zero-offset bias subtracted from sif_740
+sif_standard_error               One-sigma theoretical retrieval uncertainty
+
+These four variables have units of mW m-2 sr-1 nm-1. sif_standard_error
+describes retrieval precision; it does not include systematic errors or
+uncertainties in the correction models.
+
+Additional variables provide footprint-center latitude and longitude,
+solar/viewing angles, cloud_fraction, mean_radiance and reduced_chi_square.
+scan_index identifies the original scanline. scan_position identifies the
+east (0), center/nadir (1) or west (2) forward-scan pixel; all three positions
+belong to NADIR observation mode. Units are included in variable attributes.
+
+4. Data screening
+-----------------
+Retained observations satisfy:
+  - NADIR observation mode and land surface;
+  - latitude > -60 degrees;
+  - solar_zenith_angle < 75 degrees and viewing_zenith_angle < 60 degrees;
+  - -5 <= sif_740 <= 5 mW m-2 sr-1 nm-1;
+  - reduced_chi_square <= 1.2;
+  - 25 <= mean_radiance <= 200 mW m-2 sr-1 nm-1.
+
+The SIF and radiance intervals include both endpoints. mean_radiance is the
+mean degradation-corrected radiance in the 743-758 nm retrieval window.
+No additional range filter is applied to sif_740_zero_offset_corrected.
+No additional cloud screening is applied; missing or invalid cloud values
+may remain. Users may apply further screening appropriate to their analysis.
+
+5. Usage notes
+--------------
+Spatial and temporal coverage is incomplete, particularly after June 2003.
+Unobserved locations and times are not interpolated or filled with zero.
+Floating-point missing values are stored as NaN. Negative SIF values can occur
+because of noise and residual offsets and should not automatically be set to zero.
+
+6. Licence and citation
+-----------------------
+Creative Commons Attribution 4.0 International (CC BY 4.0).
+https://creativecommons.org/licenses/by/4.0/
+Please acknowledge GOME-LSIF and cite the accompanying paper when using the data.

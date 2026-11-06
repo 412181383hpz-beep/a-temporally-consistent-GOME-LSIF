@@ -1,6 +1,7 @@
 # ================== 训练数据构建（仅支持 MODE_NADIR） ==================
 import os
-import sys
+import csv
+import traceback
 import numpy as np
 import netCDF4 as nc
 from datetime import datetime
@@ -9,11 +10,52 @@ from tqdm import tqdm
 import gome_sif_utils as f
 from global_land_mask import globe
 
+def to_nan_array(x):
+    array = np.asanyarray(x)
+    if np.ma.isMaskedArray(array):
+        if not np.issubdtype(array.dtype, np.inexact):
+            array = array.astype(float)
+        return array.filled(np.nan)
+    return np.asarray(array)
+
+
+def nadir_geometry(band4):
+    """Check variable shapes before indexing the first time/centre-angle sample."""
+    geo = band4.groups['GEODATA'].variables
+    variables = {
+        'radiance': band4.groups['OBSERVATIONS'].variables['radiance'],
+        'longitude': geo['longitude'], 'latitude': geo['latitude'],
+        'SZA': geo['solar_zenith_angle'], 'VZA': geo['viewing_zenith_angle'],
+        'cloud': band4.groups['CLOUDDATA'].variables['cloud_fraction'],
+    }
+    for key in ('solar_azimuth_angle', 'viewing_azimuth_angle'):
+        if key in geo:
+            variables[key] = geo[key]
+    shapes = {name: tuple(var.shape) for name, var in variables.items()}
+    lon = shapes['longitude']
+    valid = len(lon) == 3 and lon[0] > 0 and lon[2] == 3
+    footprint = lon[1:]
+    for name, shape in shapes.items():
+        if name == 'radiance':
+            valid = valid and len(shape) == 4 and shape[0] > 0 and shape[1:3] == footprint
+        elif name in ('longitude', 'latitude', 'cloud'):
+            valid = valid and len(shape) == 3 and shape[0] > 0 and shape[1:] == footprint
+        else:
+            valid = valid and len(shape) == 4 and shape[0] > 0 and shape[1:3] == footprint and shape[3] > 1
+    return bool(valid), shapes
+
 # --- 配置参数 ---
+#years = [1995, 1996, 1997, 1998, 1999, 2000, 2001, 2002, 2003]  # 示例年份，替换为实际需要的年份
 years = list(range(1995, 2012))
+#years = [1995,1996]
 
 start_month = 1
 end_month = 12
+SZA_MAX = 75.0
+VZA_MAX = 60.0
+train_root = 'outputs/training_raw'
+GOME_ROOT = 'data/GOME'
+AVHRR_ROOT = 'data/AVHRR'
 # 850-734=116，758-734=24
 start_wl = 743
 end_wl = 758
@@ -22,25 +64,24 @@ spectral_num = 72
 for year in years:
     print(f"正在处理年份: {year}")
     
-    train_folder = fr'F:\traindata_GOME_Band4_NADIR\{year}' 
+    train_folder = os.path.join(train_root, str(year)) 
     os.makedirs(train_folder, exist_ok=True)
 
-    AVHRR_folder = fr'F:\AVHRR_slim\{year}' # 修改：使用精简后的AVHRR数据路径
+    AVHRR_folder = os.path.join(AVHRR_ROOT, str(year)) # 修改：使用精简后的AVHRR数据路径
     if os.path.exists(AVHRR_folder):
-        avhrr_files = [
-            os.path.join(AVHRR_folder, filename)
-            for filename in os.listdir(AVHRR_folder)
-            if filename.endswith('.nc')
-        ]
+        avhrr_files = sorted(os.path.join(AVHRR_folder, name) for name in os.listdir(AVHRR_folder) if name.endswith('.nc'))
     else:
         avhrr_files = []
         print(f"  [警告] 找不到该年份的 AVHRR 数据: {AVHRR_folder}")
 
-    GOME_folder = fr'F:\GOME\{year}'
+    GOME_folder = os.path.join(GOME_ROOT, str(year))
 
     # 获取选定的月份文件夹
     all_month_folders = f.get_first_level_folders(GOME_folder)
-    selected_month_folders = [mf for mf in all_month_folders if start_month <= int(os.path.basename(mf)) <= end_month]
+    # 首尾年份限定为 1995 年 6 月至 2011 年 6 月。
+    first_month = 6 if year == 1995 else start_month
+    last_month = 6 if year == 2011 else end_month
+    selected_month_folders = [mf for mf in all_month_folders if first_month <= int(os.path.basename(mf)) <= last_month]
 
     all_target_day_folders = []
     for mf in selected_month_folders:
@@ -52,7 +93,11 @@ for year in years:
         date_str = f"{year}{month_str.zfill(2)}{day_str.zfill(2)}"
 
         out_file = os.path.join(train_folder, f'{date_str}_traindata.npz')
+        lineage_file = out_file.replace('_traindata.npz', '_lineage.csv')
         if os.path.exists(out_file):
+            if not os.path.exists(lineage_file):
+                raise RuntimeError(f'已有训练文件缺少来源表，请先检查：{out_file}')
+            print(f'[SKIP] 已存在: {out_file}')
             continue
 
         try:
@@ -68,16 +113,41 @@ for year in years:
             try:
                 with nc.Dataset(gfile) as ds:
                     if 'MODE_NADIR' in ds.groups and 'BAND_4' in ds.groups['MODE_NADIR'].groups:
+                        geometry_ok, shapes = nadir_geometry(ds.groups['MODE_NADIR'].groups['BAND_4'])
+                        if not geometry_ok:
+                            print(f'[SKIP_NONSTANDARD_GEOMETRY] {gfile} | shapes={shapes}')
+                            geometry_qa = os.path.join(train_folder, 'training_orbit_QA.csv')
+                            new_qa = not os.path.exists(geometry_qa)
+                            with open(geometry_qa, 'a', newline='', encoding='utf-8-sig') as stream:
+                                writer = csv.writer(stream)
+                                if new_qa:
+                                    writer.writerow(['date', 'source_file', 'status', 'shapes'])
+                                writer.writerow([date_str, gfile, 'skipped_nonstandard_geometry', str(shapes)])
+                            continue
                         nadir_files.append(gfile)
-            except:
-                continue
+            except Exception as e:
+                print(f"[ERROR] NADIR read failed: {gfile} | {type(e).__name__}: {e}")
+                traceback.print_exc()
+                raise
 
         if not nadir_files:
+            print(f'[NO_NADIR] {date_str}: 没有 NADIR/BAND_4 数据')
             continue
 
         # 2. 第二步：处理 AVHRR 掩膜
         avhrr_path = next((p for p in avhrr_files if f"{year}{DOY}" in os.path.basename(p)), None)
         if not avhrr_path:
+            print(f'[SKIP_MISSING_AVHRR] {date_str}: 找不到同日 AVHRR 文件，跳过当天训练数据生成')
+            qa_file = os.path.join(train_folder, 'training_daily_QA.csv')
+            new_qa = not os.path.exists(qa_file)
+            with open(qa_file, 'a', newline='', encoding='utf-8-sig') as stream:
+                writer = csv.writer(stream)
+                if new_qa:
+                    writer.writerow(['date', 'status', 'output_file', 'avhrr_file',
+                                     'nadir_orbits', 'zero_sample_orbits', 'N', 'Soil_N',
+                                     'Cloud_N', 'Snow_N', 'SZA_LT70_N', 'SZA_70_75_N', 'max_SZA'])
+                writer.writerow([date_str, 'SKIP_MISSING_AVHRR', '', '', len(nadir_files),
+                                 '', '', '', '', '', '', '', ''])
             continue
 
         ds_avhrr = nc.Dataset(avhrr_path)
@@ -93,14 +163,11 @@ for year in years:
             NDVI = (Band2 - Band1) / (Band2 + Band1)
 
         # 掩膜定义
-        # 裸土 (Soil): NDVI低, 且温度偏高 (> 285K) 意味着地表物理温度必须大于 12℃, 排除了撒哈拉的冷云
-        # 加上 Band1 < 0.4 是为了防止和雪（Band1 > 0.4）撞车
-        # 基础无植被条件是 NDVI < 0.10 和 Band1 > 0.10，进一步细化为裸土需要满足 BT_11um > 275K 或者 Band1 < 0.4 且 BT_11um > 245K
-        # 雪 (Snow): NDVI低, Band1和Band2都较高, 且温度较低 (< 265K) 意味着地表物理温度必须小于 -8℃，排除了撒哈拉的冷云
-        # 海洋云 (Ocean Cloud): Band1和Band2都较高, 且温度较低 (< 265K) 意味着地表物理温度必须小于 -8℃，排除了撒哈拉的冷云
-        base_soil = (NDVI < 0.10) & (Band1 > 0.10)
+        # Soil 温度条件保留原写法，实际等价于 BT_11um > 245 K。
+        # 类别编码：0=Soil、1=Cloud、2=Snow；重叠时优先 Soil。
+        base_soil = (NDVI < 0.15) & (Band1 > 0.10)
         mask_soil = (base_soil & (BT_11um > 275.0)) | (base_soil & (BT_11um > 245.0))
-        mask_snow = (NDVI < 0.1) & (Band1 > 0.4) & (Band2 > 0.4) & (BT_11um < 265.0)
+        mask_snow = (NDVI < 0.15) & (Band1 > 0.4) & (Band2 > 0.4) & (BT_11um < 265.0)
         mask_ocean_cloud = (Band1 > 0.6) & (Band2 > 0.6) & (BT_11um < 265.0)
 
         # 3. 第三步：GOME 云量辅助（仅针对筛选出的 nadir_files）
@@ -112,15 +179,21 @@ for year in years:
                     cf = mode.groups['BAND_4'].groups['CLOUDDATA'].variables['cloud_fraction'][0]
                     lon = mode.groups['BAND_4'].groups['GEODATA'].variables['longitude'][0]
                     lat = mode.groups['BAND_4'].groups['GEODATA'].variables['latitude'][0]
-                    valid = (cf >= 0) & (cf <= 1)
+                    cf, lon, lat = to_nan_array(cf), to_nan_array(lon), to_nan_array(lat)
+                    valid = np.isfinite(cf) & np.isfinite(lon) & np.isfinite(lat) & (cf >= 0) & (cf <= 1)
                     cloud_frac_all.append(cf[valid]); lon_all.append(lon[valid]); lat_all.append(lat[valid])
-            except: pass
+            except Exception as e:
+                print(f"[ERROR] Cloud read failed: {gfile} | {type(e).__name__}: {e}")
+                traceback.print_exc()
+                raise
 
         if not cloud_frac_all: continue
         cloud_fra_grid = f.calculate_grid_mean(np.concatenate(lon_all), np.concatenate(lat_all), np.concatenate(cloud_frac_all), 0.1)
 
         # 4. 第四步：数据提取主循环
         day_traindata, day_traincols, day_traintype, day_trainlons, day_trainlats, day_trainsza = [], [], [], [], [], []
+        day_lineage = []
+        zero_sample_orbits = 0
         
         for gfile in nadir_files:
             try:
@@ -136,23 +209,35 @@ for year in years:
                     SZA = band4.groups['GEODATA'].variables['solar_zenith_angle'][0, :, :, 1]
                     VZA = band4.groups['GEODATA'].variables['viewing_zenith_angle'][0, :, :, 1]
 
-                    wl = ds.groups['CALIBRATION'].variables['wavelength'][0, 3]
+                    rad = to_nan_array(rad)
+                    lons = to_nan_array(lons)
+                    lats = to_nan_array(lats)
+                    SZA = to_nan_array(SZA)
+                    VZA = to_nan_array(VZA)
+
+                    wl = to_nan_array(ds.groups['CALIBRATION'].variables['wavelength'][0, 3])
                     wl_mask = (wl >= start_wl) & (wl <= end_wl)
                     idx = np.where(wl_mask)[0]
-                    if len(idx) < spectral_num: continue
+                    if len(idx) < spectral_num:
+                        raise ValueError(f'{gfile}: 743-758 nm 通道少于 {spectral_num}')
                     
                     s_idx = idx[0]
                     e_idx = s_idx + spectral_num
                     rad_sel = rad[:, :, s_idx:e_idx] * 1.986446e-9 / wl[s_idx:e_idx][np.newaxis, np.newaxis, :]
 
+                    rad_sel = to_nan_array(rad_sel)
                     n_scan, n_pix = rad_sel.shape[:2]
                     mask = np.zeros((n_scan, n_pix), bool)
                     type_map = -1 * np.ones((n_scan, n_pix), np.int8)
 
                     for i in range(n_scan):
                         for j in range(n_pix):
-                            # 1. 安全检查：如果坐标是 NaN，直接跳过当前像素点
-                            if np.isnan(lons[i, j]) or np.isnan(lats[i, j]):
+                            # Skip only the observation with invalid coordinates, geometry or spectrum.
+                            if not (np.isfinite(lons[i, j]) and np.isfinite(lats[i, j])):
+                                continue
+                            if not (np.isfinite(SZA[i, j]) and np.isfinite(VZA[i, j])):
+                                continue
+                            if not np.all(np.isfinite(rad_sel[i, j, :])):
                                 continue
                             # 2. 修正索引计算
                             # 经度：-180 -> 0, 180 -> 3600
@@ -190,26 +275,68 @@ for year in years:
                             else:
                                 if ocean_cloud_ratio > 0.7 and cloud_mean > 0.95: t = 1
 
-                            if t >= 0 and SZA[i, j] < 70 and VZA[i, j] < 60:
+                            if t >= 0 and SZA[i, j] < SZA_MAX and VZA[i, j] < VZA_MAX:
                                 mask[i, j] = True
                                 type_map[i, j] = t
 
                     if np.any(mask):
-                        day_traindata.append(rad_sel[mask])
+                        day_traindata.append(rad_sel[mask].astype(np.float32))
                         day_traincols.append(np.tile(np.arange(n_pix), (n_scan, 1))[mask])
                         day_traintype.append(type_map[mask])
-                        day_trainlons.append(lons[mask])
-                        day_trainlats.append(lats[mask])
-                        day_trainsza.append(SZA[mask])
-            except: pass
+                        day_trainlons.append(lons[mask].astype(np.float32))
+                        day_trainlats.append(lats[mask].astype(np.float32))
+                        day_trainsza.append(SZA[mask].astype(np.float32))
+                        scans, columns = np.where(mask)
+                        day_lineage.extend((gfile, int(scan), int(col)) for scan, col in zip(scans, columns))
+                    else:
+                        zero_sample_orbits += 1
+            except Exception as e:
+                print(f"[ERROR] Failed orbit: {gfile} | {type(e).__name__}: {e}")
+                traceback.print_exc()
+                raise
 
         if day_traindata:
-            np.savez(out_file,
-                     traindata=np.concatenate(day_traindata, axis=0),
-                     traincols=np.concatenate(day_traincols, axis=0),
-                     traintype=np.concatenate(day_traintype, axis=0),
-                     trainlons=np.concatenate(day_trainlons, axis=0), 
-                     trainlats=np.concatenate(day_trainlats, axis=0),
-                     trainsza=np.concatenate(day_trainsza, axis=0)) 
+            arrays = dict(
+                traindata=np.concatenate(day_traindata, axis=0),
+                traincols=np.concatenate(day_traincols, axis=0),
+                traintype=np.concatenate(day_traintype, axis=0),
+                trainlons=np.concatenate(day_trainlons, axis=0),
+                trainlats=np.concatenate(day_trainlats, axis=0),
+                trainsza=np.concatenate(day_trainsza, axis=0))
+            n = len(arrays['traindata'])
+            if arrays['traindata'].shape != (n, spectral_num) or len(day_lineage) != n:
+                raise ValueError(f'{date_str}: 光谱或来源表行数不一致')
+            tmp_file = out_file + '.tmp.npz'
+            tmp_lineage = lineage_file + '.tmp'
+            np.savez(tmp_file, **arrays)
+            with open(tmp_lineage, 'w', newline='', encoding='utf-8-sig') as stream:
+                writer = csv.writer(stream)
+                writer.writerow(['daily_row_index', 'source_file', 'scan_index', 'detector_column'])
+                writer.writerows((row, *source) for row, source in enumerate(day_lineage))
+            os.replace(tmp_lineage, lineage_file)
+            os.replace(tmp_file, out_file)
+            types = arrays['traintype']
+            sza = arrays['trainsza']
+            counts = [int(np.sum(types == code)) for code in (0, 1, 2)]
+            print(f'[WRITTEN] {date_str}: N={n}, Soil/Cloud/Snow={counts}, '
+                  f'70<=SZA<75={np.sum(sza >= 70)}, max SZA={np.max(sza):.4f}')
+        else:
+            n, counts = 0, [0, 0, 0]
+            sza = np.array([], dtype=np.float32)
+            print(f'[NO_SAMPLES] {date_str}: 筛选后没有样本，不写空 NPZ')
 
-print("所有年份训练数据完成！勇敢的探索者，数据已就绪。")
+        # 简单日清单放在年份目录；来源信息单独保存，不增加训练 NPZ 变量。
+        qa_file = os.path.join(train_folder, 'training_daily_QA.csv')
+        new_qa = not os.path.exists(qa_file)
+        with open(qa_file, 'a', newline='', encoding='utf-8-sig') as stream:
+            writer = csv.writer(stream)
+            if new_qa:
+                writer.writerow(['date', 'status', 'output_file', 'avhrr_file',
+                                 'nadir_orbits', 'zero_sample_orbits', 'N', 'Soil_N',
+                                 'Cloud_N', 'Snow_N', 'SZA_LT70_N', 'SZA_70_75_N', 'max_SZA'])
+            writer.writerow([date_str, 'WRITTEN' if n else 'NO_SAMPLES',
+                             out_file if n else '', avhrr_path, len(nadir_files),
+                             zero_sample_orbits, n, *counts, int(np.sum(sza < 70)),
+                             int(np.sum(sza >= 70)), float(np.max(sza)) if n else ''])
+
+print("所选年份和月份处理结束；请查看 WRITTEN / NO_NADIR / NO_SAMPLES / SKIP_MISSING_AVHRR 日志。")
